@@ -1,0 +1,611 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+ 
+import os
+import re
+import shutil
+import subprocess
+import sys
+import logging
+ 
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+ 
+# Old maildata
+ 
+OldDataPath     = "/home.tmp/"
+OldQmailPath    = os.path.join(OldDataPath, "qmail/")
+OldVpopmailPath = os.path.join(OldDataPath, "vpopmail/")
+ 
+OldUsersAssignFilename = os.path.join(OldQmailPath, "users/assign")
+OldVpasswordFilename  = "vpasswd"
+ 
+OldWrongInitialReferencePath = "/home/vpopmail/"
+OldRightInitialReferencePath = "/home.tmp/vpopmail/"
+ 
+# New maildata - if we can't get the info otherwise and won't use SQL
+ 
+NewVpopmailPath = "/home/vpopmail/"
+NewVcommandPath = os.path.join( NewVpopmailPath, "bin/" )
+ 
+NewFileUserID  = 89
+NewFileGroupId = 89
+ 
+NewUserAddressBookPath = "/var/lib/squirrelmail/prefs"
+ 
+RsyncPath = "/usr/bin/rsync"
+# RsyncParams = "-Hxvrl -pogD -t --delete --force --progress" # Øyvinds parameter suggestions
+RsyncParams1 = "-Hxvrl"
+RsyncParams2 = "-pogD"
+RsyncParams3 = "-t"
+RsyncParams4 = "--delete"
+RsyncParams5 = "--force"
+# RsyncParams6 = "--progress"
+
+# -----------------------------------------------------------------------------
+# User utility functions
+# -----------------------------------------------------------------------------
+ 
+def OldUserInfo(DomainPath, User):
+ 
+    # if User == "":
+    OldUsers = set()
+    # else:
+    UserComment = ""
+    UserPath = ""
+    UserQuota = ""
+    UserPassword = ""
+    UserEncryptedPassword = ""
+ 
+    # Get needed info - step 2
+ 
+    with open( os.path.join( DomainPath, OldVpasswordFilename), encoding = "iso-8859-1" ) as f: # TODO test password æøå
+        for line in f:
+            cols = line.split(":", 7)
+ 
+            # Check content
+            if len(cols) < 7 or len(cols) > 8: # Wrong format line
+                raise Exception( "Exactly 7 or 8 fields on each line are expected in {} - line is {}".format( os.path.join( DomainPath, OldVpasswordFilename), line ) )
+            if cols[ len(cols)-1 ][ len(  cols[ len(cols)-1 ]  )-1 ] != "\n":
+                raise Exception( "Exactly 7 or 8 fields on each line are expected in {} - line is {}".format( os.path.join( DomainPath, OldVpasswordFilename), line ) )
+            
+            # Clean the file input
+            cols[ len(cols)-1 ] = cols[ len(cols)-1 ][0:len(  cols[ len(cols)-1 ]  )-1] # Remove trailing "\n" in last field
+ 
+            # Use the line
+            if User == "":
+                # Return User list (set)
+                OldUsers.add( cols[0] )
+            else:
+                # Return specific User info
+                if cols[0] == User:
+ 
+                    UserComment  = cols[4]
+                    UserPath     = cols[5]
+                    UserQuota    = cols[6]
+                    if len(cols) > 7:
+                        UserPassword = cols[7]
+                    UserEncryptedPassword = cols[1]
+ 
+                    # Check stuff
+                    if UserPath == "":
+                        raise Exception( "{} account folder for domain {} is not found in {}".format(User, Domain, os.path.join( DomainPath, OldVpasswordFilename) ) )
+                    if UserQuota == "":
+                        raise Exception( "{} account quota for domain {} is not found in {}".format(User, Domain, os.path.join( DomainPath, OldVpasswordFilename) ) )
+                    if UserPassword == "":
+                        if UserEncryptedPassword == "":
+                            raise Exception( "{} account password AND encrypted password for domain {} is not found in {}".format(User, Domain, os.path.join( DomainPath, OldVpasswordFilename) ) )
+ 
+                    if not UserPath.startswith(OldWrongInitialReferencePath):
+                        raise Exception( "{} account folder path for domain {} should start with {} in {}".format(
+                                        User, 
+                                        Domain, 
+                                        OldWrongInitialReferencePath, 
+                                        os.path.join(DomainPath, OldVpasswordFilename)) )
+ 
+                    # Correct path for difference between old and new hotel
+                    UserPath = UserPath.replace(OldWrongInitialReferencePath, OldRightInitialReferencePath, 1)
+ 
+                    break # Search no more
+ 
+    if User == "":
+        return OldUsers
+    else:
+        return UserComment, UserPath, UserQuota, UserPassword, UserEncryptedPassword
+ 
+# -----------------------------------------------------------------------------
+# Transfer mailboxes/users/accounts
+# -----------------------------------------------------------------------------
+ 
+def BuildUser(Domain, DomainPath, User, Create):
+ 
+    UserComment, UserPath, UserQuota, UserPassword, UserEncryptedPassword = OldUserInfo(DomainPath, User)
+ 
+    # Create User if needed
+    if Create and User != "postmaster":
+ 
+        try:
+            if UserPassword == "":
+                raise Exception(123)
+ 
+            result = subprocess.check_output(
+                [ os.path.join( NewVcommandPath, "vadduser" ), 
+                    "-q", UserQuota,
+                    "-c", UserComment,
+                    User + "@" + Domain, 
+                    UserPassword.encode("iso-8859-1") ],
+                universal_newlines = True
+                )
+        except Exception as e:
+            result = subprocess.check_output(
+                [ os.path.join( NewVcommandPath, "vadduser" ), 
+                    "-q", UserQuota,
+                    "-c", UserComment,
+                    User + "@" + Domain, 
+                    "-e", UserEncryptedPassword ],
+                universal_newlines = True
+                )
+ 
+        # TODO: Set User Options - "pref"
+        
+        
+    # Find destination folder
+ 
+    result = subprocess.check_output( 
+        [ os.path.join( NewVcommandPath, "vuserinfo" ), "-d", User + "@" + Domain ],
+        universal_newlines = True
+        )
+    NewUserPath = ""
+    for line in result.split("\n"):
+        if line == "":
+            continue
+        NewUserPath = line
+    if NewUserPath == "":
+        raise Exception("Uha")
+ 
+
+    # User address books merge into one single going forward
+    
+    if Create: # Also for Postmaster
+        OldAddressBookFilename = os.path.join( UserPath, "Maildir", "sqwebmail-addressbook" )
+        NewAddressBookFilename = os.path.join( NewUserAddressBookPath, User + "@" + Domain + ".abook" )
+ 
+        try:
+            oldfile = open(OldAddressBookFilename, encoding = "iso-8859-1" ) 
+        except IOError as e:
+            pass # No addressbook exists for this user
+        else:
+            with oldfile:
+                with open(NewAddressBookFilename, "w") as newfile:                 
+                    WantFirstLine = True
+ 
+                    FirstLineRegex = re.compile( "^([^\:]+)\:\s+\"([^\"]+)\"\s+\<([^\>]+)\>\s*(\,?)$" )
+                    SecondLineRegex = re.compile( "^\s+\"([^\"]+)\"\s+\<([^\>]+)\>\s*(\,?)$" )
+                    
+                    for l in oldfile:
+                        print(repr(l)) # TODO
+                        if l == "\n":
+                            continue
+                        if WantFirstLine:
+                            # <AddressBookName> : W  " <nickname> " W  "<" <EmailAddress> ">" [","] \n
+                            Match = FirstLineRegex.match(l)
+                            if Match == None:
+                                continue # TODO Også format med flere linier på samme linie
+                                raise Exception ("Ukendt format i adressebog")
+                            if Match.group(1) == "" or Match.group(2) == "" or Match.group(3) == "" or not (Match.group(4) == "" or Match.group(4) == "," ):
+                                raise Exception ( "Uha" )
+ 
+                            # Skriv i ny adressebog: <Nickname> "|" <Firstname> "|" <Lastname> | <mailaddress> "|" <additionalinfo>
+                            print( "AB: {}|AB: {}|AB: {}|{}|{}".format( Match.group(1).replace("|","#"), Match.group(1).replace("|","#"), Match.group(1).replace("|","#"), "", "" ), file = newfile)
+                            print( "{}|{}|{}|{}|{}".format( Match.group(2).replace("|","#"), "", "", Match.group(3).replace("|","#"), "" ), file = newfile) 
+ 
+                            if Match.group(4) == ",":
+                                WantFirstLine = False
+                        else:
+                            # W " <nickname> " W  "<" <EmailAddress> ">" [","] \n
+                            Match = SecondLineRegex.match(l)
+                            if Match == None:
+                                continue # TODO Også format med flere linier på samme linie
+                                raise Exception ("Ukendt format i adressebog")
+                            if Match.group(1) == "" or Match.group(2) == "" or not (Match.group(3) == "" or Match.group(3) == "," ):
+                                raise Exception ( "Uha" )
+ 
+                            # Skriv i ny adressebog: <Nickname> "|" <Firstname> "|" <Lastname> | <mailaddress> "|" <additionalinfo>
+                            print( "{}|{}|{}|{}|{}".format( Match.group(1).replace("|","#"), "", "", Match.group(2).replace("|","#"), "" ), file = newfile) 
+ 
+                            if Match.group(3) != ",":
+                                WantFirstLine = True
+                # TODO Set owner and rights
+ 
+    # Mailfolders - rsync 
+ 
+    result = subprocess.check_output(
+        [ RsyncPath,
+          # RsyncParams,
+          RsyncParams1,
+          RsyncParams2,
+          RsyncParams3,
+          RsyncParams4,
+          RsyncParams5,
+          # RsyncParams6,
+ 
+          os.path.join( UserPath, "Maildir", ""),
+          os.path.join( NewUserPath, "Maildir", "")
+        ],
+        universal_newlines = True
+        )
+    print
+    print(result)
+    print
+ 
+    return
+ 
+# -----------------------------------------------------------------------------
+# Domain utility functions
+# -----------------------------------------------------------------------------
+ 
+def OldDomainInfo(Domain):
+ 
+    # if Domain == "":
+    OldDomains = set()
+    # else:
+    DomainPath = ""
+    DomainAliases = set()
+ 
+    with open( OldUsersAssignFilename, encoding = "iso-8859-1" ) as f: # TODO test user name æøå
+        for line in f:
+            # Ignore the "." line
+            if line == ".\n":
+                continue
+ 
+            cols = line.split(":", 7 )
+ 
+            # Check content
+            if len(cols) != 8: # Wrong format line
+                raise Exception( "Exactly 8 fields on each line - or ""."" - are expected in {} - line is {}".format(OldUsersAssignFilename, line) )
+            if cols[0][0] != "+" or cols[0][ len(cols[0])-1 ] != "-" or cols[7][ len(cols[7])-1 ] != "\n":
+                raise Exception( "Line should start with """"+"""" in {} - line is {}".format(OldUsersAssignFilename, line) )
+ 
+            # Clean the file input
+            cols[0] = cols[0][1:len( cols[0] )-1] # Remove leading "+" and trailing "-"
+            cols[7] = cols[7][0:len( cols[7] )-1] # Remove trailing "\n"
+ 
+            # Use the line
+            if Domain == "":
+                if cols[0] == cols[1]: # This is a domain, not a domain alias
+                    OldDomains.add(cols[1])
+            else:
+                if cols[1] == Domain: # Regarding this domain
+                    if cols[0] == cols[1]: # This is the domain, not a domain alias
+                        DomainPath = cols[4]
+                    else:
+                        DomainAliases.add(cols[0])
+ 
+    if Domain == "":
+        return OldDomains
+    else:
+        # Check
+        if DomainPath == "":
+            raise Exception( "Unable to find domain path for {} in {}".format(Domain, OldUsersAssignFilename) )
+        if not DomainPath.startswith(OldWrongInitialReferencePath):
+            raise Exception( "Domain path should start with {} for {} in {}".format(OldWrongInitialReferencePath, Domain, OldUsersAssignFilename) )
+ 
+        # Correct path for difference between old and new hotel
+        DomainPath = DomainPath.replace(OldWrongInitialReferencePath, OldRightInitialReferencePath, 1)
+ 
+        return DomainPath, DomainAliases
+ 
+# -----------------------------------------------------------------------------
+# Transfer domain
+# -----------------------------------------------------------------------------
+ 
+def BuildDomain(Domain, Create):
+    
+    # Get needed info - step 1
+ 
+    DomainPath, DomainAliases = OldDomainInfo(Domain)
+ 
+    
+    # Create Domain if needed
+    
+    if Create:
+ 
+        # Get needed info - step 2
+ 
+        PostmasterUserComment, PostmasterFolder, PostmasterQuota, PostmasterPassword, PostmasterEncryptedPassword = OldUserInfo(DomainPath, "postmaster")
+ 
+        #
+        # The domain
+        #
+        
+        result = subprocess.check_output(
+            [ os.path.join( NewVcommandPath, "vadddomain" ), Domain, PostmasterPassword.encode("iso-8859-1"), "-q", PostmasterQuota ],
+            universal_newlines = True
+            )
+ 
+        # 
+        # Domain aliases
+        #
+ 
+        for alias in DomainAliases:
+ 
+            process = subprocess.check_output(
+                [ os.path.join( NewVcommandPath, "vaddaliasdomain" ), alias, Domain ],
+                universal_newlines = True
+                )
+ 
+        #
+        # Domain forwarders, mailing lists and autoresponders
+        #
+ 
+        entries = os.listdir( DomainPath )
+        for e in entries:
+            if e.startswith(".qmail-"):
+                if os.path.islink( os.path.join(DomainPath, e) ):
+                    # Mailing lists
+                    SymlinkLeftsideEnd = e # Expected syntax  ".qmail-"   <LISTNAME>   [-<SOMETHING>]
+ 
+                    SymlinkRightside = os.readlink( os.path.join(DomainPath, e) ) # Expected syntax "/home/vpopmail/domains/givenDomain.dk/<LISTNAMEMEDPUNKTUM>"   /<SOMEMORE>
+ 
+                    NewDomainPath = DomainPath.replace(OldRightInitialReferencePath, OldWrongInitialReferencePath, 1)
+                    MaillistFolder = SymlinkRightside.replace( os.path.join(NewDomainPath, "") , "", 1) .split("/") [0]
+ 
+                    if not SymlinkRightside.startswith( os.path.join( NewDomainPath, MaillistFolder, "") ):
+                        raise Exception( "Mailing list name or path problem should start with {} for {} in {}".format( os.path.join( DomainPath, MaillistFolder, "") , MaillistFolder, SymlinkRightside) )
+ 
+
+                    if not os.path.isdir( os.path.join( NewDomainPath, MaillistFolder, "") ):
+                        # Copy mailing list directory tree
+ 
+                        shutil.copytree(
+                            os.path.join( DomainPath, MaillistFolder, ""),
+                            os.path.join( NewDomainPath, MaillistFolder, "")
+                        )
+ 
+                        os.chown( os.path.join( NewDomainPath, MaillistFolder), NewFileUserID, NewFileGroupId)
+                        for dirpath, dirnames, filenames in os.walk( os.path.join( NewDomainPath, MaillistFolder) ):
+                            os.chmod( dirpath, 0o700)
+                            os.chown( dirpath, NewFileUserID, NewFileGroupId)
+ 
+                            for filename in filenames:
+                                os.chmod( os.path.join( dirpath, filename), 0o700)
+                                os.chown( os.path.join( dirpath, filename), NewFileUserID, NewFileGroupId)
+ 
+                    os.symlink( SymlinkRightside, os.path.join( NewDomainPath, SymlinkLeftsideEnd ) )
+                    os.lchown(  os.path.join( NewDomainPath, SymlinkLeftsideEnd), NewFileUserID, NewFileGroupId)
+                elif os.path.isfile( os.path.join(DomainPath, e) ):
+                    if e == ".qmail-default":
+                        QmailDefaultFile = os.path.join(DomainPath, e)
+                        shutil.copy2(
+                            QmailDefaultFile,
+                            QmailDefaultFile.replace(OldRightInitialReferencePath, OldWrongInitialReferencePath, 1)
+                        )
+                        os.chown(QmailDefaultFile, NewFileUserID, NewFileGroupId)
+                    else:
+                        global DeferredForwarderCreations
+ 
+                        with open( os.path.join( DomainPath, e ), encoding = "iso-8859-1" ) as f: # TODO Test æøå
+                            for l in f:
+                                if l == "\n":
+                                    continue
+                                elif l.startswith("&"):
+                                    # Forwarder
+                                    ForwardFrom =  e[7:]
+                                    ForwardTo = l[0: len(l)-1 ] # Example value &test@gmail.com\n - must include "&" but not \n
+ 
+                                    # Call VALIAS now
+                                    # result = subprocess.check_output(
+                                    #     [ os.path.join( NewVcommandPath, "valias" ), "-i", ForwardTo, ForwardFrom + "@" + Domain ],
+                                    #     universal_newlines=True
+                                    #     )
+ 
+                                    # Call VALIAS later, the ForwardTo user may not be created yet
+                                    DeferredForwarderCreations.append( (ForwardTo, ForwardFrom + "@" + Domain ) )
+                                elif l.startswith("|"):
+                                    # Autoresponder
+ 
+                                    cols = l[1: len(l)-1 ].split(" ")
+                                    AutoresponderPath = cols[ len(cols)-1 ]
+                                    AutoresponderFile = cols[ len(cols)-2 ]
+                                    if AutoresponderPath=="":
+                                        raise Exception( "Autoresponder path missing domain {} autoresponder {}".format(Domain, e[7:] ) )
+                                    if AutoresponderFile=="":
+                                        raise Exception( "Autoresponder file missing domain {} autoresponder {}".format(Domain, e[7:] ) )
+                                    if not AutoresponderPath.startswith(OldWrongInitialReferencePath):
+                                        raise Exception( "Autoresponder path should start with {} for {} in {}".format(OldWrongInitialReferencePath, Domain, e[7:] ) )
+ 
+                                    # Copy autoresponder message                                
+ 
+                                    os.mkdir(AutoresponderPath, 0o700)
+                                    os.chown(AutoresponderPath, NewFileUserID, NewFileGroupId)
+ 
+                                    shutil.copy2(
+                                        AutoresponderFile.replace(OldWrongInitialReferencePath, OldRightInitialReferencePath, 1),
+                                        AutoresponderFile
+                                    )
+                                    os.chown(AutoresponderFile, NewFileUserID, NewFileGroupId)
+ 
+                                    # Create the alias
+ 
+                                    # Call VALIAS now
+                                    # result = subprocess.check_output(
+                                    #     [ 
+                                    #         os.path.join( NewVcommandPath, "valias" ), 
+                                    #         "-i", 
+                                    #         l[0: len(l)-1 ],
+                                    #         e[7:] + "@" + Domain
+                                    #     ],                          
+                                    #     universal_newlines=True
+                                    #     )
+ 
+                                    # Call VALIAS later, the ForwardTo user may not be created yet
+                                    DeferredForwarderCreations.append( (l[0: len(l)-1 ], e[7:] + "@" + Domain ) )
+                                else:
+                                   
+                                    raise Exception( "Unknown line type in {}".format( e ) )
+ 
+    
+    # List Old Users
+ 
+    OldUsers = OldUserInfo(DomainPath, "")
+ 
+
+    # List New Users
+ 
+    NewUsers = set()
+    result = subprocess.check_output( 
+        [ os.path.join( NewVcommandPath, "vuserinfo" ), "-nD", Domain ],
+        universal_newlines = True
+        )
+ 
+    for line in result.split("\n"):
+        if line == "":
+            continue
+        NewUsers.add(line)
+ 
+    # # List User Operations needed
+ 
+    DeleteUsers = NewUsers.difference(OldUsers)
+    CreateUsers = OldUsers.difference(NewUsers)
+    UpdateUsers = OldUsers.difference(CreateUsers)
+ 
+    
+    print()
+    print("Processing Domain {}".format(Domain))
+    print()
+ 
+    print
+    print("OLDUSERS {}".format( len(OldUsers) ))
+    print( OldUsers )
+    print
+    print("NEWUSERS {}".format( len(NewUsers) ))
+    print( NewUsers )
+    print
+    print
+    print
+    print("DELETE {}".format( len(DeleteUsers) ))
+    print( DeleteUsers )
+    print
+    print("CREATE {}".format( len(CreateUsers) ))
+    print( CreateUsers )
+    print
+    print("UPDATE {}".format( len(UpdateUsers) ))
+    print( UpdateUsers )
+    print
+ 
+    # Delete users that need deleting
+ 
+    for entry in DeleteUsers:
+        result = subprocess.check_output(
+            [ os.path.join( NewVcommandPath, "vdeluser" ), entry + "@" + Domain ],
+            universal_newlines = True
+            )
+ 
+    # Add users that need adding
+ 
+    for entry in CreateUsers:
+        BuildUser(Domain, DomainPath, entry, True)
+ 
+    # Update users that need updating
+ 
+    for entry in UpdateUsers:
+        BuildUser(Domain, DomainPath, entry, False)
+ 
+    return
+ 
+# -----------------------------------------------------------------------------
+# Main program
+# -----------------------------------------------------------------------------
+ 
+# List Old Domains
+ 
+OldDomains = OldDomainInfo("")
+ 
+# List New Domains
+ 
+NewDomains = set()
+result = subprocess.check_output( 
+    [ os.path.join( NewVcommandPath, "vdominfo" ), "-n" ],
+    universal_newlines = True
+    )
+ 
+for line in result.split("\n"):
+    if line == "":
+        continue
+    if line.find("(alias of ") == -1:
+        NewDomains.add(line)
+ 
+
+# List Domain Operations needed
+ 
+DeleteDomains = NewDomains.difference(OldDomains)
+CreateDomains = OldDomains.difference(NewDomains)
+UpdateDomains = OldDomains.difference(CreateDomains)
+ 
+print
+print("OLDDOMAINS {}".format( len(OldDomains) ))
+print( OldDomains )
+print
+print("NEWDOMAINS {}".format( len(NewDomains) ))
+print( NewDomains )
+print
+print
+print
+print("DELETE {}".format( len(DeleteDomains) ))
+print( DeleteDomains )
+print
+print("CREATE {}".format( len(CreateDomains) ))
+print( CreateDomains )
+print
+print("UPDATE {}".format( len(UpdateDomains) ))
+print( UpdateDomains )
+print
+ 
+# Start listing forwarders for domains and users that need to be executed after domains and users are all transferred
+ 
+DeferredForwarderCreations = []
+
+# Delete domains that need deleting
+ 
+for Domain in DeleteDomains:
+    result = subprocess.check_output(
+        [ os.path.join( NewVcommandPath, "vdeldomain" ), "-f", Domain ],
+        universal_newlines=True
+        )
+ 
+# Add domains that need adding
+ 
+for Domain in CreateDomains:
+    BuildDomain(Domain, True) # Including users/accounts/mailboxes/aliases
+ 
+# Update domains that need updating
+  
+for Domain in UpdateDomains:
+    BuildDomain(Domain, False) # Users/accounts/mailboxes are added or deleted - and all users' mail folders are updated
+ 
+# Now create the deferred forwarders
+ 
+for f in DeferredForwarderCreations:
+    try:    
+        result = subprocess.check_output(
+            [ os.path.join( NewVcommandPath, "valias" ), "-i", f[0], f[1] ],
+            universal_newlines=True
+            )
+    except subprocess.CalledProcessError as e:
+        # print(e)
+        # if (hasattr(e,"stderr") and
+        #    e.returncode == 255 and 
+        #    e.stderr.startswith("Error: alias ") and
+        #    e.stderr.endswith(" already exists.")
+        #    ):
+        #     pass
+        # elif (hasattr(e, "stdout") and
+        #    e.returncode == 255 and 
+        #    e.stdout.startswith("Error: alias ") and
+        #    e.stdout.endswith(" already exists.")
+        #    ):
+        raise e
+ 
+sys.exit(0)
